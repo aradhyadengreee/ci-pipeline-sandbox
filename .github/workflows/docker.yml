@@ -1,0 +1,335 @@
+# .github/workflows/docker.yml
+
+name: CI - Scan, Review and Push Docker
+
+on:
+  push:
+    branches:
+      - test
+      - master
+  pull_request:
+    branches:
+      - test
+      - master
+  # Lets you run the scans on any branch from the Actions tab without opening a
+  # PR or pushing to test/master - useful while validating the tools themselves.
+  workflow_dispatch:
+
+# Superseded PR runs are cancelled; deploys to test/master are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. SonarQube Cloud - static analysis + quality gate
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    name: SonarQube Cloud Scan
+    runs-on: ubuntu-latest
+    # Runs on push, manual dispatch, and same-repo PRs. Fork PRs are skipped:
+    # they cannot read secrets, so the scan would fail on an empty token.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history improves Sonar's new-code / blame attribution.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Falls back to `npm install` if the lockfile is out of sync with
+      # package.json, which would otherwise hard-fail `npm ci`.
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      # Coverage feeds Sonar's coverage metric. Remove if the project has no
+      # test script yet - Sonar will simply report 0% coverage.
+      - name: Run tests with coverage
+        run: npm test -- --coverage --coverageReporters=lcov
+        continue-on-error: true
+
+      # Blocks on pull_request; warns on push and manual dispatch, so a
+      # newly-raised Sonar issue cannot brick a deploy to test/master.
+      - name: SonarQube Cloud scan and quality gate
+        uses: SonarSource/sonarqube-scan-action@v8
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=src
+            -Dsonar.tests=src
+            -Dsonar.test.inclusions=**/*.test.js
+            -Dsonar.exclusions=**/node_modules/**,coverage/**
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+            -Dsonar.qualitygate.wait=true
+
+      # NOTE: this generic CLI scan is correct for Node/TypeScript, Python and Go.
+      # A JVM (Maven/Gradle) or .NET project MUST use the build-integrated
+      # scanner instead - a generic scan there produces a near-empty analysis:
+      #   mvn verify sonar:sonar -Dsonar.token=$SONAR_TOKEN
+      #   dotnet sonarscanner begin ... / dotnet build / dotnet sonarscanner end
+
+  # ---------------------------------------------------------------------------
+  # 2. Snyk - dependency (SCA) scan
+  # ---------------------------------------------------------------------------
+  snyk-dependencies:
+    name: Snyk Dependency Scan
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      # Blocks on pull_request; warns on push and manual dispatch.
+      - name: Snyk test (npm dependencies)
+        uses: snyk/actions/node@master
+        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --severity-threshold=high
+            --all-projects
+            --sarif-file-output=snyk-deps.sarif
+
+      # Requires GitHub Advanced Security on private repos; non-fatal if absent.
+      - name: Upload Snyk SARIF to code scanning
+        if: always() && hashFiles('snyk-deps.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-dependencies
+
+  # ---------------------------------------------------------------------------
+  # 3. Automated code review (OpenAI Codex / GPT) - pull requests only
+  #
+  # Deliberately a different vendor from the assistant the developers author
+  # with, so the reviewer is not the same model that wrote the code.
+  #
+  # Unlike claude-code-action, codex-action does NOT post to the PR itself - it
+  # returns the review text on its `final-message` output, which the next step
+  # posts. Consequence: one summary comment per run, not inline per-line
+  # comments. See the notes at the end of this job for the inline option.
+  # ---------------------------------------------------------------------------
+  code-review:
+    name: Automated Code Review (GPT)
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history so the PR base ref is available locally for diffing.
+          fetch-depth: 0
+
+      # `fetch-depth: 0` should already bring the base branch down, but make it
+      # explicit: if `origin/<base>` does not resolve, the diff command in the
+      # prompt fails silently and Codex reviews the whole repo (or nothing)
+      # while still producing review-shaped output. Idempotent if already present.
+      - name: Ensure PR base ref is available
+        run: git fetch --no-tags origin "${{ github.base_ref }}"
+
+      - name: Codex review
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Review must never mutate the checkout or reach the network.
+          sandbox: read-only
+          # `model` and `effort` are intentionally unset so the action's own
+          # default applies. Pin them explicitly once you have chosen a model
+          # and confirmed it against OpenAI's current model list - do not
+          # guess an identifier here.
+          #   model: <model-id>
+          #   effort: high
+          #
+          # For a prompt this long, `prompt-file: .github/codex/prompts/review.md`
+          # is the maintainable option - it keeps the prompt reviewable in its
+          # own right and out of the workflow file.
+          prompt: >-
+            Review the changes on this branch against its merge base
+            (`git diff origin/${{ github.base_ref }}...HEAD`). Focus on
+            correctness bugs, security issues (OWASP Top 10 and OWASP LLM Top
+            10), missing input validation, hardcoded credentials or secrets,
+            unparameterised SQL, and error handling around external calls.
+            Flag any handling of student, client or credential data that lacks
+            data minimisation or a clear lawful basis under India's DPDP Act
+            2023. Report findings most severe first, each as
+            `path/to/file.ts:LINE` followed by the problem and a concrete fix.
+            Do not comment on pure formatting or naming preferences. If you
+            find nothing worth raising, reply with exactly: No issues found.
+
+      # The review text is model output, so it is passed through `env` rather
+      # than interpolated into the script body - a `${{ }}` splice of model
+      # output into JavaScript is a script-injection vector.
+      # Upserts a single marked comment so pushing to the PR updates the
+      # existing review instead of appending a new comment each time.
+      - name: Post review to the pull request
+        if: always() && steps.codex.outputs.final-message != ''
+        uses: actions/github-script@v7
+        env:
+          REVIEW_BODY: ${{ steps.codex.outputs.final-message }}
+        with:
+          script: |
+            const MARKER = '<!-- codex-review -->';
+            const body = `${MARKER}\n### Automated review (GPT / Codex)\n\n${process.env.REVIEW_BODY}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number },
+            );
+            const existing = comments.find(
+              (c) => c.user.type === 'Bot' && c.body?.includes(MARKER),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
+
+      # To get true inline comments instead of one summary comment, have Codex
+      # emit structured findings and post them as a review:
+      #   1. add `output-schema-file: .github/codex/review-schema.json`
+      #      describing `{findings: [{path, line, severity, comment}]}`
+      #   2. in the script above, call `github.rest.pulls.createReview` with
+      #      `event: 'COMMENT'` and a `comments: [{path, line, body}]` array.
+      # This is more moving parts and the line numbers must map to the diff, so
+      # start with the summary comment and add it only if the team wants it.
+
+  # ---------------------------------------------------------------------------
+  # 4. Build and push Docker image - push events only
+  #
+  # OFF BY DEFAULT. Gated on the repository variable ENABLE_DEPLOY, which does
+  # not exist yet, so this job is skipped and nothing is pushed to ECR. That
+  # keeps the scan and review jobs testable without AWS credentials.
+  #
+  # To turn deployment on later:
+  #   Settings > Secrets and variables > Actions > Variables
+  #   ENABLE_DEPLOY = true
+  # and make sure AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY and the
+  # DOCKER_REGISTRY / APP_NAME variables are set. No workflow edit needed.
+  # ---------------------------------------------------------------------------
+  docker-build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    # PR events must never push to ECR, and fork PRs have no AWS credentials.
+    #
+    # `needs` is kept for ORDERING only - scans always finish before the push.
+    # `!cancelled()` means a scan job that fails outright (bad token, broken
+    # `npm ci`, runner error) still only warns on push, matching the
+    # step-level `continue-on-error` in those jobs. Without it, `needs` would
+    # skip this job and a scan outage would block the deploy.
+    # To make scans hard-block the deploy on push too, drop `&& !cancelled()`.
+    if: >-
+      github.event_name == 'push' &&
+      vars.ENABLE_DEPLOY == 'true' &&
+      !cancelled()
+    needs:
+      - sonarqube
+      - snyk-dependencies
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+
+    environment:
+      name: ${{ github.ref == 'refs/heads/master' && 'production' || 'test' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:${{ github.sha }}
+            ${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:latest
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+          no-cache: true
+
+      # Scan-after-push: the image must exist in ECR to be scanned, so a
+      # vulnerable image does land in the registry before we know. Report-only
+      # by design - failing here would not un-push the image. To gate the push
+      # instead, change the build step to `load: true, push: false`, scan the
+      # local tag, then add a separate push step.
+      - name: Snyk container scan (report only)
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:${{ github.sha }}
+          args: >-
+            --severity-threshold=high
+            --file=Dockerfile
+            --sarif-file-output=snyk-container.sarif
+
+      - name: Upload container SARIF to code scanning
+        if: always() && hashFiles('snyk-container.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: snyk-container.sarif
+          category: snyk-container

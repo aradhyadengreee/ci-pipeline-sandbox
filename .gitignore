@@ -1,0 +1,11 @@
+node_modules/
+coverage/
+*.sarif
+
+# Never commit real secrets - the pipeline reads them from GitHub secrets.
+.env
+.env.*
+!.env.example
+
+npm-debug.log*
+.DS_Store

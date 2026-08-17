@@ -1,0 +1,10 @@
+.git
+.github
+node_modules
+coverage
+*.sarif
+*.test.js
+.env
+.env.*
+npm-debug.log*
+README.md
