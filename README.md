@@ -64,6 +64,42 @@ To enable it later, set `ENABLE_DEPLOY = true` under
 *Settings → Secrets and variables → Actions → Variables* and add the AWS
 secrets and `DOCKER_REGISTRY` / `APP_NAME` variables. No workflow edit required.
 
+## Single branch, two environments
+
+`master` is the only long-lived branch. One push to it produces one image,
+which is then promoted:
+
+```
+push to master
+  └─ scans (warn) ─┐
+                   ├─ build ──► push <registry>/<app>:<sha>
+                   │              └─ Deploy to test ──► tag :test
+                   │                   └─ Deploy to production ──► tag :prod
+```
+
+The build happens **once**. The two deploy jobs never rebuild — they run
+`docker buildx imagetools create`, which retags the existing manifest in the
+registry without pulling it. So `:prod` and `:test` always point at the exact
+image that was scanned, and production can only receive something that already
+went through test (`needs: deploy-test`).
+
+`:latest` is no longer published. Use `:test` and `:prod` as the moving
+pointers, and `:<sha>` when you need to name one specific build.
+
+### Approval gates
+
+Each deploy job declares `environment: test` / `environment: production`, which
+is what makes GitHub apply that environment's protection rules. Configure the
+gate under *Settings → Environments → production → Required reviewers*. The run
+then pauses at **Deploy to production** until someone approves.
+
+This is deliberately not in the workflow file — adding or removing a reviewer,
+or a wait timer, needs no code change. Per-environment secrets set there also
+resolve inside the matching job.
+
+To roll back, re-run the **Deploy to production** job on the older commit's
+workflow run: it retags `:prod` onto that build's `:<sha>` without rebuilding.
+
 ## Required GitHub configuration
 
 Repository **secrets** — set these as *repository* secrets, not environment
@@ -84,14 +120,22 @@ Repository **variables**: `SONAR_ORGANIZATION` and `SONAR_PROJECT_KEY` now;
 
 | Trigger | Sonar | Snyk deps | GPT review | Deploy |
 | --- | :-: | :-: | :-: | :-: |
-| Push to `test`/`master` | warn | warn | – | off (gated) |
-| PR into `test`/`master` | **block** | **block** | yes | – |
+| Push to `master` | warn | warn | – | off (gated) |
+| PR into `master` | warn | warn | **block** | – |
 | Manual run (Actions tab) | warn | warn | – | – |
 | PR from a fork | skipped | skipped | skipped | – |
 
 *warn* means a failing gate annotates the run but does not fail it; *block*
 means the check fails. Blocking a **merge** additionally requires marking those
 checks as required in branch protection settings.
+
+The automated GPT review is the only check that can fail a PR. Sonar and Snyk
+report findings without failing the run. To make either block again, set
+`continue-on-error: ${{ github.event_name != 'pull_request' }}` on that scan
+step — the comment above each one says so.
+
+`SONAR_ORGANIZATION` and `SONAR_PROJECT_KEY` are read as a repository variable
+*or* a secret (`vars.X || secrets.X`), so either placement works.
 
 Fork PRs are skipped deliberately: they cannot read secrets, so the scans would
 fail on an empty token rather than telling you anything useful.
