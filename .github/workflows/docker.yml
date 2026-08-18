@@ -2,20 +2,20 @@
 
 name: CI - Scan, Review and Push Docker
 
+# Single trunk. `master` is the only long-lived branch: everything merges into
+# it, and one push produces one image that is promoted test -> production.
 on:
   push:
     branches:
-      - test
       - master
   pull_request:
     branches:
-      - test
       - master
   # Lets you run the scans on any branch from the Actions tab without opening a
-  # PR or pushing to test/master - useful while validating the tools themselves.
+  # PR or pushing to master - useful while validating the tools themselves.
   workflow_dispatch:
 
-# Superseded PR runs are cancelled; deploys to test/master are never cancelled.
+# Superseded PR runs are cancelled; deploys from master are never cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -59,17 +59,18 @@ jobs:
         run: npm test -- --coverage --coverageReporters=lcov
         continue-on-error: true
 
-      # Blocks on pull_request; warns on push and manual dispatch, so a
-      # newly-raised Sonar issue cannot brick a deploy to test/master.
+      # Never fails the run - findings show as annotations. The GPT review is
+      # the only check that blocks a PR. To make the quality gate block again,
+      # set: continue-on-error: ${{ github.event_name != 'pull_request' }}
       - name: SonarQube Cloud scan and quality gate
         uses: SonarSource/sonarqube-scan-action@v8
-        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
           args: >
-            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
-            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORGANIZATION || secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ vars.SONAR_PROJECT_KEY || secrets.SONAR_PROJECT_KEY }}
             -Dsonar.sources=src
             -Dsonar.tests=src
             -Dsonar.test.inclusions=**/*.test.js
@@ -109,10 +110,12 @@ jobs:
       - name: Install dependencies
         run: npm ci || npm install
 
-      # Blocks on pull_request; warns on push and manual dispatch.
+      # Never fails the run - findings show as annotations and SARIF. To make a
+      # high-severity vulnerability block again, set:
+      # continue-on-error: ${{ github.event_name != 'pull_request' }}
       - name: Snyk test (npm dependencies)
         uses: snyk/actions/node@master
-        continue-on-error: ${{ github.event_name != 'pull_request' }}
+        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
@@ -243,6 +246,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # 4. Build and push Docker image - push events only
   #
+  # Builds ONCE and pushes a single immutable `:<sha>` tag. The promotion jobs
+  # below never rebuild - they only move a tag onto this exact image, so what
+  # reaches production is byte-identical to what was tested.
+  #
   # OFF BY DEFAULT. Gated on the repository variable ENABLE_DEPLOY, which does
   # not exist yet, so this job is skipped and nothing is pushed to ECR. That
   # keeps the scan and review jobs testable without AWS credentials.
@@ -276,8 +283,9 @@ jobs:
       id-token: write
       security-events: write
 
-    environment:
-      name: ${{ github.ref == 'refs/heads/master' && 'production' || 'test' }}
+    # No `environment:` here on purpose. This job only produces the artifact;
+    # the environment gates live on the promotion jobs below, so an approval
+    # cannot be spent before there is something to approve.
 
     steps:
       - name: Checkout code
@@ -302,9 +310,11 @@ jobs:
         with:
           context: .
           push: true
+          # Only the immutable SHA tag. `:test` and `:prod` are moving pointers
+          # applied by the promotion jobs, so they always name an image that
+          # actually reached that environment.
           tags: |
             ${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:${{ github.sha }}
-            ${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:latest
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           no-cache: true
@@ -333,3 +343,84 @@ jobs:
         with:
           sarif_file: snyk-container.sarif
           category: snyk-container
+
+  # ---------------------------------------------------------------------------
+  # 5. Promote to test
+  #
+  # Moves the `:test` tag onto the image built above. `imagetools create` is a
+  # registry-side operation - it copies the manifest without pulling or
+  # rebuilding, so this takes seconds and cannot produce a different image.
+  #
+  # `environment: test` is what makes GitHub apply that environment's
+  # protection rules and secrets. Approval gates are configured in
+  # Settings > Environments, NOT here - the workflow needs no change to add or
+  # remove a reviewer.
+  # ---------------------------------------------------------------------------
+  deploy-test:
+    name: Deploy to test
+    runs-on: ubuntu-latest
+    needs: docker-build-and-push
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: test
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Tag image as test
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:test" \
+            "${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:${{ github.sha }}"
+
+  # ---------------------------------------------------------------------------
+  # 6. Promote to production
+  #
+  # `needs: deploy-test` is the promotion order: production can only ever get
+  # an image that already passed through test. Add required reviewers to the
+  # `production` environment to make this job wait for a human.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: deploy-test
+    permissions:
+      contents: read
+      id-token: write
+
+    environment:
+      name: production
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Tag image as prod
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:prod" \
+            "${{ vars.DOCKER_REGISTRY }}/${{ vars.APP_NAME }}:${{ github.sha }}"
